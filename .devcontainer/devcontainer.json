@@ -1,0 +1,32 @@
+// ~/allo-host/.devcontainer/devcontainer.json
+{
+  "name": "Allo (existing allo_dev)",
+  "containerName": "allo_dev",
+  "workspaceFolder": "/root/allo",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/root/allo,type=bind,consistency=cached",
+
+  // Host (macOS) and remote (Linux) shell settings:
+  "settings": {
+    // On your Mac, VS Code will use zsh by default
+    "terminal.integrated.shell.osx": "/bin/zsh",
+    "terminal.integrated.shellArgs.osx": ["-l"],
+
+    // Inside the container, keep using bash so conda.sh works without extra installs
+    "terminal.integrated.shell.linux": "/bin/bash",
+    "terminal.integrated.shellArgs.linux": ["-l"]
+  },
+
+  "extensions": [
+    "ms-python.python",
+    "ms-toolsai.jupyter",
+    "ms-vscode.cpptools"
+  ],
+
+  "forwardPorts": [8888],
+
+  // Runs once when the container starts
+  "postStartCommand": "pip install --root-user-action=ignore -e /root/allo && pip install --root-user-action=ignore torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu",
+
+  // Runs each time you attach a VS Code session
+  "postAttachCommand": "source /root/miniconda/etc/profile.d/conda.sh && conda activate allo"
+}
