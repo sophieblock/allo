@@ -84,11 +84,7 @@ def CustomizationOp : Allo_Op<"customization", [
   let arguments = (ins SymbolNameAttr:$sym_name,
                        TypeAttrOf<FunctionType>:$function_type);
   let regions = (region AnyRegion:$body);
-  
-  let builders = [OpBuilder<(ins
-    "StringRef":$name, "FunctionType":$type,
-    CArg<"ArrayRef<NamedAttribute>", "{}">:$attrs)
-  >];
+
   let extraClassDeclaration = [{
     //===------------------------------------------------------------------===//
     // CallableOpInterface
@@ -230,6 +226,29 @@ def ApplyOp : Allo_Op<"apply", [CallOpInterface,
     /// Set the callee for this operation.
     void setCalleeFromCallable(CallInterfaceCallable callee) {
       (*this)->setAttr("callee", callee.get<SymbolRefAttr>());
+    }
+    
+    /// ArgAndResultAttrsOpInterface
+    ::mlir::ArrayAttr getArgAttrsAttr() {
+      return nullptr;
+    }
+
+    ::mlir::ArrayAttr getResAttrsAttr() {
+      return nullptr;
+    }
+    
+    void setArgAttrsAttr(::mlir::ArrayAttr attrs) {
+    }
+
+    void setResAttrsAttr(::mlir::ArrayAttr attrs) {
+    }
+
+    ::mlir::Attribute removeArgAttrsAttr() {
+        return nullptr;
+    }
+
+    ::mlir::Attribute removeResAttrsAttr() {
+        return nullptr;
     }
   }];
 }
@@ -682,10 +701,10 @@ def Allo_ReplaceOp : Allo_Op<"replace">
 // Fixed-point operations
 //===----------------------------------------------------------------------===//
 
-def AnyFixed : Type<CPred<"$_self.isa<allo::FixedType>() || $_self.isa<allo::UFixedType>()">, "fixed-point",
+def AnyFixed : Type<CPred<"::llvm::isa<::mlir::allo::FixedType>($_self) || ::llvm::isa<::mlir::allo::UFixedType>($_self)">, "fixed-point",
                     "allo::AnyFixedType">;
 def FixedLike: TypeConstraint<Or<[AnyFixed.predicate,
-        VectorOf<[AnyFixed]>.predicate, TensorOf<[AnyFixed]>.predicate]>,
+        VectorOfAnyRankOf<[AnyFixed]>.predicate, TensorOf<[AnyFixed]>.predicate]>,
     "fixed-point-like">;
 
 class FixedBinaryOp<string mnemonic, list<Trait> traits = []> :
@@ -916,7 +935,7 @@ def OrOp : Allo_Op<"or"> {
 //===----------------------------------------------------------------------===//
 
 def YieldOp : Allo_Op<"yield", [NoMemoryEffect, Terminator,
-                               ParentOneOf<["AndOp, OrOp"]>]> {
+                               ParentOneOf<["AndOp", "OrOp", "GridMapOp"]>]> {
   let summary = "yield and termination operation";
   let description = [{
     "allo.yield" yields an SSA value from the Allo dialect op region and
@@ -1029,6 +1048,56 @@ def StreamPutOp : Allo_Op<"stream_put"> {
   }];
 }
 
+def StreamGlobalOp : Allo_Op<"stream_global", [Symbol]> {
+  let summary = "Create a global stream object";
+  let arguments = (ins SymbolNameAttr:$sym_name, TypeAttr:$element_type, DenseI64ArrayAttr:$shape);
+  let assemblyFormat = [{
+      $sym_name `:` $element_type $shape  attr-dict
+  }];
+  let hasVerifier = 1;
+}
+
+def GlobalStreamGetOp : Allo_Op<"get_stream_global"> {
+  let summary = "Get an object from a global stream";
+  // arguments:
+  // - $global: symbol name of the global stream
+  // - $indices: variadic index operands
+  // - $map: affine map
+  let arguments = (
+    ins FlatSymbolRefAttr:$global,
+        Variadic<Index>:$indices,
+        AffineMapAttr:$map
+  );
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+  let hasCustomAssemblyFormat = 1;
+  let extraClassDeclaration = [{
+    void simplifyAffineMap();
+  }];
+}
+
+def GlobalStreamPutOp : Allo_Op<"put_stream_global"> {
+  let summary = "Put an object to a global stream";
+  // arguments:
+  // - $global: symbol name of the global stream
+  // - $indices: variadic index operands
+  // - $data: value to put
+  // - $map: affine map to compute indices
+  let arguments = (
+      ins FlatSymbolRefAttr:$global,
+          Variadic<Index>:$indices,
+          AnyType:$data,
+          AffineMapAttr:$map
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+  let hasCustomAssemblyFormat = 1;
+  let extraClassDeclaration = [{
+    void simplifyAffineMap();
+  }];
+}
+
+
 //===----------------------------------------------------------------------===//
 // Layout operations
 //===----------------------------------------------------------------------===//
@@ -1075,6 +1144,37 @@ def TransformLayoutOp : Allo_Op<"transform_layout"> {
             `strides` `=` $strides
             attr-dict `:` type($source) `->` type($result)
   }];
+}
+
+//===----------------------------------------------------------------------===//
+// SPMW operations
+//===----------------------------------------------------------------------===//
+def GridMapOp : Allo_Op<"grid_map",
+  [RecursiveMemoryEffects, SingleBlockImplicitTerminator<"YieldOp">]> {
+  let summary = "Grid map operation";
+  let description = [{
+    The grid_map operation distributes a computation over a logical grid.
+    It takes a list of memrefs with static shape (`tensors`) as input arguments.
+    It contains a single block whose arguments are the sharded memrefs. The operations in the block can access variables in parent regions.
+  }];
+
+  let arguments = (ins
+    Variadic<AnyStaticShapeMemRef>:$tensors,
+    ArrayAttr:$sharding,
+    DenseI64ArrayAttr:$grid
+  );
+  let regions = (region SizedRegion<1>:$body);
+
+  let assemblyFormat = [{
+    `(` $tensors `)`
+    `sharding` `=` $sharding
+    `grid` `=` $grid
+    $body
+    attr-dict
+    `:` type($tensors)
+  }];
+
+  let hasVerifier = 1;
 }
 
 #endif // ALLO_OPS

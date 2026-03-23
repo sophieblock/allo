@@ -68,7 +68,21 @@ ctype_map = {
 }
 
 
-def codegen_host(top, module):
+def codegen_host(top, module, num_output_args=0):
+    """Generate OpenCL host code for Vitis HLS.
+
+    Parameters
+    ----------
+    top : str
+        Top-level function name
+    module : Module
+        MLIR module containing the function
+    num_output_args : int, optional
+        Number of trailing input arguments that are actually output buffers.
+        When len(outputs) == 0 (common for dataflow), this specifies how many
+        of the inputs are written to by the kernel and need to be migrated back.
+        Default is 0, which falls back to legacy behavior (last input is output).
+    """
     # Reference: https://github.com/Xilinx/Vitis_Accel_Examples/blob/main/sys_opt/kernel_swap/src/host.cpp
     func = find_func_in_module(module, top)
     inputs, outputs = get_func_inputs_outputs(func)
@@ -191,9 +205,19 @@ def codegen_host(top, module):
         // Device-to-host communication
         """
     )
+    # Determine which input indices are actually outputs
+    output_input_indices = set()
+    if len(outputs) == 0:
+        if num_output_args > 0:
+            output_input_indices = set(
+                range(len(inputs) - num_output_args, len(inputs))
+            )
+        else:
+            # Legacy behavior: assume last input is output
+            output_input_indices = {len(inputs) - 1}
+
     for i, (in_dtype, in_shape) in enumerate(inputs):
-        if i == len(inputs) - 1 and len(outputs) == 0:
-            # suppose the last input is also the output
+        if i in output_input_indices:
             flag = "CL_MEM_READ_WRITE"
         else:
             flag = "CL_MEM_READ_ONLY"
@@ -267,9 +291,11 @@ def codegen_host(top, module):
             strip=False,
         )
     else:
+        # Migrate back all output input buffers
+        output_buffers = [f"buffer_in{i}" for i in sorted(output_input_indices)]
         out_str += format_str(
             "OCL_CHECK(err, err = q.enqueueMigrateMemObjects({"
-            + ", ".join([f"buffer_in{len(inputs) - 1}"])
+            + ", ".join(output_buffers)
             + "}, CL_MIGRATE_MEM_OBJECT_HOST));",
             strip=False,
         )
@@ -306,14 +332,12 @@ def codegen_host(top, module):
         """,
     )
     out_str += "\n\n"
-    assert len(outputs) <= 1, "Only support one output for now"
-    if len(outputs) == 0:
-        out_buf = "source_in" + str(len(inputs) - 1)
-    else:
+    # Write output files
+    if len(outputs) > 0:
+        assert len(outputs) <= 1, "Only support one explicit output for now"
         out_buf = "source_out" + str(len(outputs) - 1)
-        # raise RuntimeError("TODO: output is not the last argument")
-    out_str += format_str(
-        f"""    // Write the output data to file
+        out_str += format_str(
+            f"""    // Write the output data to file
     std::ofstream ofile;
     ofile.open("output.data", std::ios::binary);
     if (!ofile) {{
@@ -323,9 +347,30 @@ def codegen_host(top, module):
     ofile.write(reinterpret_cast<const char*>({out_buf}.data()), {buffer_bytes[-1]});
     ofile.close();
     """,
-        strip=False,
-        indent=0,
-    )
+            strip=False,
+            indent=0,
+        )
+    else:
+        # Write multiple output files for each output input buffer
+        out_str += format_str(
+            "    // Write the output data to files", strip=False, indent=0
+        )
+        for idx, i in enumerate(sorted(output_input_indices)):
+            out_str += format_str(
+                f"""    {{
+        std::ofstream ofile{idx};
+        ofile{idx}.open("output{idx}.data", std::ios::binary);
+        if (!ofile{idx}) {{
+            std::cerr << "Failed to open output file {idx}!" << std::endl;
+            return EXIT_FAILURE;
+        }}
+        ofile{idx}.write(reinterpret_cast<const char*>(source_in{i}.data()), {buffer_bytes[i]});
+        ofile{idx}.close();
+    }}
+""",
+                strip=False,
+                indent=0,
+            )
     out_str += format_str("return EXIT_SUCCESS;", strip=False)
     out_str += "}\n"
     return out_str
@@ -386,9 +431,26 @@ def generate_description_file(top, src_path, dst_path, frequency):
         desc = f.read()
     desc = desc.replace("top", top)
     desc = json.loads(desc)
+    # Use a config file for HLS options (--hls.* can only be in config files)
+    desc["containers"][0]["accelerators"][0]["clflags"] = "--config hls.cfg"
+    # Set kernel frequency at link time for placement & routing
     desc["containers"][0]["ldclflags"] += f"  --kernel_frequency {frequency}"
     with open(dst_path, "w", encoding="utf-8") as outfile:
         json.dump(desc, outfile, indent=4)
+
+    # Generate HLS pre-tcl script to set clock
+    # This bypasses v++ option parsing validation issues
+    assert frequency > 0, "Frequency must be positive"
+    clock_period_ns = 1000.0 / frequency
+    hls_tcl_path = dst_path.replace("description.json", "hls_pre.tcl")
+    with open(hls_tcl_path, "w", encoding="utf-8") as tcl_file:
+        tcl_file.write(f"create_clock -period {clock_period_ns:.4f} -name default\n")
+
+    # Generate HLS config file referencing the pre-tcl script
+    hls_cfg_path = dst_path.replace("description.json", "hls.cfg")
+    with open(hls_cfg_path, "w", encoding="utf-8") as cfg_file:
+        cfg_file.write("[hls]\n")
+        cfg_file.write("pre_tcl=hls_pre.tcl\n")
 
 
 def update_makefile(file_name, ext_libs):
@@ -418,3 +480,112 @@ def read_tensor_from_file(dtype, shape, file_path):
         dtype = "f32"
     arr = np.fromfile(file_path, sep="\n", dtype=np_supported_types[dtype])
     return arr.reshape(shape)
+
+
+def extract_hls_arg_names(hls_code, top_func_name):
+    """
+    Extract argument names from the HLS function signature.
+
+    Parameters:
+    -----------
+    hls_code : str
+        The generated HLS code
+    top_func_name : str
+        The top-level function name
+
+    Returns:
+    --------
+    list[str]
+        List of argument names in order
+    """
+    func_decl = False
+    args = []
+    for line in hls_code.split("\n"):
+        if line.startswith(f"void {top_func_name}"):
+            func_decl = True
+        elif func_decl and line.startswith(") {"):
+            break
+        elif func_decl:
+            # Parse argument line like "  int32_t *v15,"
+            line = line.strip()
+            if line:
+                # Remove trailing comma
+                if line.endswith(","):
+                    line = line[:-1]
+                # Extract variable name (last word, possibly with *)
+                parts = line.split()
+                if parts:
+                    var_name = parts[-1].lstrip("*")
+                    args.append(var_name)
+    return args
+
+
+def generate_hbm_config(top_func_name, hbm_mapping, arg_name_mapping=None):
+    """
+    Generate HLS configuration file content for HBM/DDR memory mapping.
+
+    Parameters:
+    -----------
+    top_func_name : str
+        The top-level function name (kernel name)
+    hbm_mapping : dict
+        A dictionary mapping function argument names to memory specifications.
+        Keys should match the argument names in the function definition.
+        Values can be:
+        - An integer: interpreted as HBM channel number (e.g., 0 -> "HBM[0]")
+        - A string: full memory specification (e.g., "HBM[0]", "DDR[1]")
+    arg_name_mapping : dict, optional
+        A mapping from user argument names to HLS argument names.
+        If provided, user argument names in hbm_mapping will be translated
+        to HLS argument names.
+
+    Returns:
+    --------
+    str
+        The configuration file content
+
+    Example:
+    --------
+    >>> # For a function: def gemm(A: int32[M, K], B: int32[K, N]) -> int32[M, N]
+    >>> hbm_mapping = {
+    ...     "A": 0,              # HBM channel 0
+    ...     "B": "HBM[1]",       # HBM channel 1 (explicit)
+    ...     "output_0": "DDR[0]", # Return value -> DDR bank 0
+    ... }
+    >>> # Note: Return values should be named "output_0", "output_1", etc.
+    >>> cfg_content = generate_hbm_config("gemm", hbm_mapping)
+    """
+    cfg_lines = ["[connectivity]", ""]
+
+    # Vitis creates kernel instances with a postfix (e.g., gemm_1 for the first instance)
+    # The sp tag must reference the kernel instance, not just the kernel name.
+    # Note: This assumes a single kernel instance (compute unit). For multiple instances,
+    # the numbering is _1, _2, _3, etc. Currently, we only support single instance configurations.
+    kernel_instance = f"{top_func_name}_1"
+
+    for user_arg_name, mem_spec in hbm_mapping.items():
+        # Handle different input formats for memory spec
+        if isinstance(mem_spec, int):
+            # Just channel number, default to HBM
+            mem_str = f"HBM[{mem_spec}]"
+        elif isinstance(mem_spec, str):
+            # Full specification like "HBM[0]" or "DDR[1]"
+            mem_str = mem_spec
+        else:
+            raise ValueError(
+                f"Invalid memory specification for '{user_arg_name}': {mem_spec}. "
+                "Expected int (HBM channel) or str (e.g., 'HBM[0]', 'DDR[1]')"
+            )
+
+        # Map user argument name to HLS argument name if mapping is provided
+        if arg_name_mapping is not None and user_arg_name in arg_name_mapping:
+            hls_arg_name = arg_name_mapping[user_arg_name]
+        else:
+            # Use the user-provided name directly
+            hls_arg_name = user_arg_name
+
+        # Generate the sp line: sp=<kernel_instance>.<arg>:<memory>
+        cfg_lines.append(f"sp={kernel_instance}.{hls_arg_name}:{mem_str}")
+
+    cfg_lines.append("")  # Add trailing newline
+    return "\n".join(cfg_lines)

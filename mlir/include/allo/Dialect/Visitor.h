@@ -32,7 +32,8 @@ public:
     return TypeSwitch<Operation *, ResultType>(op)
         .template Case<
             // SCF statements.
-            scf::ForOp, scf::IfOp, scf::ParallelOp, scf::ReduceOp,
+            scf::ForOp, scf::IfOp, scf::WhileOp, scf::ConditionOp,
+            scf::ParallelOp, scf::ReduceOp,
             scf::ReduceReturnOp, scf::YieldOp,
             // Affine statements.
             affine::AffineForOp, affine::AffineIfOp, affine::AffineParallelOp,
@@ -59,6 +60,7 @@ public:
             arith::DivFOp, arith::RemFOp,
             // Integer binary expressions.
             arith::CmpIOp, arith::AddIOp, arith::SubIOp, arith::MulIOp,
+            arith::FloorDivSIOp,
             arith::DivSIOp, arith::RemSIOp, arith::DivUIOp, arith::RemUIOp,
             arith::MaxSIOp, arith::MinSIOp, arith::MaxUIOp, arith::MinUIOp,
             arith::MaximumFOp, arith::MinimumFOp,
@@ -109,6 +111,8 @@ public:
   // SCF statements.
   HANDLE(scf::ForOp);
   HANDLE(scf::IfOp);
+  HANDLE(scf::WhileOp);
+  HANDLE(scf::ConditionOp);
   HANDLE(scf::ParallelOp);
   HANDLE(scf::ReduceOp);
   HANDLE(scf::ReduceReturnOp);
@@ -187,6 +191,7 @@ public:
   HANDLE(arith::RemSIOp);
   HANDLE(arith::DivUIOp);
   HANDLE(arith::RemUIOp);
+  HANDLE(arith::FloorDivSIOp);
   HANDLE(arith::MaxSIOp);
   HANDLE(arith::MinSIOp);
   HANDLE(arith::MaxUIOp);

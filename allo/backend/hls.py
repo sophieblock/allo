@@ -13,6 +13,7 @@ from .._mlir.ir import (
     Context,
     Location,
     Module,
+    UnitAttr,
 )
 from .._mlir.passmanager import PassManager
 
@@ -23,6 +24,8 @@ from .vitis import (
     generate_description_file,
     write_tensor_to_file,
     read_tensor_from_file,
+    generate_hbm_config,
+    extract_hls_arg_names,
 )
 from .pynq import (
     postprocess_hls_code_pynq,
@@ -31,12 +34,17 @@ from .pynq import (
 from .tapa import (
     codegen_tapa_host,
 )
+from .catapult import (
+    codegen_tcl as codegen_tcl_catapult,
+    codegen_host as codegen_host_catapult,
+)
 from .ip import IPModule
 from .report import parse_xml
 from ..passes import (
     _mlir_lower_pipeline,
     decompose_library_function,
     generate_input_output_buffers,
+    analyze_arg_load_store,
 )
 from ..harness.makefile_gen.makegen import generate_makefile
 from ..ir.transform import find_func_in_module
@@ -127,12 +135,13 @@ def copy_ext_libs(ext_libs, project):
         os.system(f"cp {impl_path} {project}/{cpp_file}")
 
 
-def separate_header(hls_code, top=None):
+def separate_header(hls_code, top=None, extern_c=True):
     func_decl = False
     sig_str = "#ifndef KERNEL_H\n"
     sig_str += "#define KERNEL_H\n\n"
     args = []
-    sig_str += 'extern "C" {\n'
+    if extern_c:
+        sig_str += 'extern "C" {\n'
     for line in hls_code.split("\n"):
         if line.startswith(f"void {top}"):
             func_decl = True
@@ -164,7 +173,8 @@ def separate_header(hls_code, top=None):
             else:  # scalar
                 var = var.split(",")[0]
                 sig_str += "  " + ele_type + " " + var + f"{comma}\n"
-    sig_str += '} // extern "C"\n'
+    if extern_c:
+        sig_str += '} // extern "C"\n'
     sig_str += "\n#endif // KERNEL_H\n"
     return sig_str, args
 
@@ -187,17 +197,32 @@ class HLSModule:
         self.project = project
         self.platform = platform
         self.ext_libs = [] if ext_libs is None else ext_libs
+        self.num_output_args = None  # Will be set from configs if provided
         if configs is not None:
-            new_configs = DEFAULT_CONFIG
+            new_configs = DEFAULT_CONFIG.copy()
             new_configs.update(configs)
             configs = new_configs
+            self.num_output_args = configs.get("num_output_args", None)
         else:
-            configs = DEFAULT_CONFIG
+            configs = DEFAULT_CONFIG.copy()
         if self.mode is not None:
             configs["mode"] = self.mode
         with Context() as ctx, Location.unknown():
             allo_d.register_dialect(ctx)
             self.module = Module.parse(str(mod), ctx)
+            func = find_func_in_module(self.module, top_func_name)
+            func.attributes["top"] = UnitAttr.get()
+            # fix: num_output_args
+            if self.num_output_args is None and len(func.type.results) == 0:
+                load_store_mapping = analyze_arg_load_store(self.module)
+                cnt = 0
+                for io_type in load_store_mapping[top_func_name]:
+                    if io_type in {"both", "out"}:
+                        cnt += 1
+                    elif io_type == "in" and cnt > 0 and platform in {"vitis_hls"}:
+                        raise RuntimeError("Output arguments must appear at the end.")
+                self.num_output_args = cnt
+
             if platform in {"vitis_hls", "pynq"}:
                 assert func_args is not None, "Need to specify func_args"
                 if wrap_io:
@@ -224,13 +249,28 @@ class HLSModule:
             )
             pm.run(self.module.operation)
         buf = io.StringIO()
+        success = True
         match platform:
+            # [NOTE]: If the HLS backend reports "<func_name> was not declared in this scope", it is likely caused by a forward reference.
+            #           MLIR allows calling functions before their definition, but C++ HLS kernels require a prior declaration.
             case "tapa":
-                allo_d.emit_thls(self.module, buf)
+                success = allo_d.emit_thls(self.module, buf)
             case "intel_hls":
-                allo_d.emit_ihls(self.module, buf)
+                success = allo_d.emit_ihls(self.module, buf)
+            case "catapult":
+                success = allo_d.emit_catapult(self.module, buf)
             case _:
-                allo_d.emit_vhls(self.module, buf)
+                # wrap_io=True has already linearized array indexing in
+                # generate_input_output_buffers, so we don't need to do it again
+                flatten = False if platform == "vivado_hls" else (not wrap_io)
+                success = allo_d.emit_vhls(self.module, buf, flatten=flatten)
+
+        if not success:
+            raise RuntimeError(
+                "Failed to emit HLS code. Check error messages above for details. "
+                "Common issues: nested functions with multi-dimensional arrays when wrap_io=False."
+            )
+
         buf.seek(0)
         self.hls_code = buf.read()
         if project is not None:
@@ -238,10 +278,13 @@ class HLSModule:
             os.makedirs(project, exist_ok=True)
             path = os.path.dirname(__file__)
             path = os.path.join(path, "../harness/")
-            if platform in {"vivado_hls", "vitis_hls", "tapa", "pynq"}:
+            if platform in {"vivado_hls", "vitis_hls", "tapa", "pynq", "catapult"}:
                 os.system("cp " + path + f"{platform.split('_')[0]}/* " + project)
                 with open(f"{project}/run.tcl", "w", encoding="utf-8") as outfile:
-                    outfile.write(codegen_tcl(top_func_name, configs))
+                    if platform == "catapult":
+                        outfile.write(codegen_tcl_catapult(top_func_name, configs))
+                    else:
+                        outfile.write(codegen_tcl(top_func_name, configs))
             copy_ext_libs(ext_libs, project)
             if self.platform == "vitis_hls":
                 assert self.mode in {
@@ -263,11 +306,45 @@ class HLSModule:
                     dst_path,
                     frequency=configs["frequency"],
                 )
-                generate_makefile(dst_path, project, self.platform)
+                hbm_mapping = configs.get("hbm_mapping", None)
+                generate_makefile(dst_path, project, self.platform, hbm_mapping)
                 header, self.args = separate_header(self.hls_code, self.top_func_name)
                 with open(f"{project}/kernel.h", "w", encoding="utf-8") as outfile:
                     outfile.write(header)
                 self.hls_code = postprocess_hls_code(self.hls_code, self.top_func_name)
+
+                # Generate HBM/DDR configuration file if hbm_mapping is provided
+                # This must be done AFTER postprocess_hls_code to get correct arg names
+                if hbm_mapping is not None:
+                    # Extract HLS argument names from the postprocessed code
+                    hls_arg_names = extract_hls_arg_names(
+                        self.hls_code, self.top_func_name
+                    )
+                    # Build mapping from user arg names to HLS arg names
+                    user_arg_names = []
+                    if func_args is not None and self.top_func_name in func_args:
+                        for arg in func_args[self.top_func_name]:
+                            if hasattr(arg, "name"):
+                                user_arg_names.append(arg.name)
+                            else:
+                                user_arg_names.append(str(arg))
+                    # Add return value name - it becomes the last argument
+                    # Use the last HLS arg name count to determine if there's a return
+                    if len(hls_arg_names) > len(user_arg_names):
+                        # There's a return value, add placeholder names
+                        for i in range(len(hls_arg_names) - len(user_arg_names)):
+                            user_arg_names.append(f"output_{i}")
+
+                    arg_name_mapping = None
+                    if len(user_arg_names) == len(hls_arg_names):
+                        arg_name_mapping = dict(zip(user_arg_names, hls_arg_names))
+
+                    cfg_content = generate_hbm_config(
+                        self.top_func_name, hbm_mapping, arg_name_mapping
+                    )
+                    cfg_path = os.path.join(project, f"{self.top_func_name}.cfg")
+                    with open(cfg_path, "w", encoding="utf-8") as cfg_file:
+                        cfg_file.write(cfg_content)
                 for lib in self.ext_libs:
                     cpp_file = lib.impl.split("/")[-1]
                     with open(f"{project}/{cpp_file}", "r", encoding="utf-8") as infile:
@@ -281,7 +358,44 @@ class HLSModule:
                 self.host_code = codegen_host(
                     self.top_func_name,
                     self.module,
+                    num_output_args=self.num_output_args,
                 )
+            elif self.platform == "catapult":
+                assert self.mode in {
+                    "csim",
+                    "csyn",
+                }, "Invalid mode for catapult"
+
+                if self.mode == "csim":
+                    self.host_code = codegen_host_catapult(
+                        self.top_func_name,
+                        self.module,
+                    )
+                else:
+                    self.host_code = ""
+
+                # For Catapult, we don't have separate kernel.h generation logic yet
+                # similar to separate_header. The kernel.cpp contains everything needed
+                # or headers are handled differently.
+                # If we want to support csim, kernel.cpp usually needs a header
+                # referenced by host.cpp.
+                # allo/backend/catapult.py's codegen_host includes "kernel.h".
+                # So we SHOULD generate kernel.h.
+                # Re-using separate_header which is generic enough for C-style headers.
+                #
+                # However, separate_header currently only understands builtin and
+                # ap_(u)int<...> types. When Catapult emits ac_int<...> (e.g., for
+                # non-standard integer widths), separate_header can raise ValueError.
+                # Fall back to including kernel.cpp directly if that happens.
+                try:
+                    header, self.args = separate_header(
+                        self.hls_code, self.top_func_name
+                    )
+                except ValueError:
+                    header = '#pragma once\n#include "kernel.cpp"\n'
+                    self.args = []
+                with open(f"{project}/kernel.h", "w", encoding="utf-8") as outfile:
+                    outfile.write(header)
             elif self.platform == "tapa":
                 assert self.mode in {
                     "csim",
@@ -302,7 +416,37 @@ class HLSModule:
                     frequency=configs["frequency"],
                 )
                 self.args = []
-                generate_makefile(dst_path, project, self.platform)
+                hbm_mapping = configs.get("hbm_mapping", None)
+                generate_makefile(dst_path, project, self.platform, hbm_mapping)
+                # Generate HBM/DDR configuration file if hbm_mapping is provided
+                if hbm_mapping is not None:
+                    # Extract HLS argument names from the code
+                    hls_arg_names = extract_hls_arg_names(
+                        self.hls_code, self.top_func_name
+                    )
+                    # Build mapping from user arg names to HLS arg names
+                    user_arg_names = []
+                    if func_args is not None and self.top_func_name in func_args:
+                        for arg in func_args[self.top_func_name]:
+                            if hasattr(arg, "name"):
+                                user_arg_names.append(arg.name)
+                            else:
+                                user_arg_names.append(str(arg))
+                    # Add placeholder for return values if needed
+                    if len(hls_arg_names) > len(user_arg_names):
+                        for i in range(len(hls_arg_names) - len(user_arg_names)):
+                            user_arg_names.append(f"output_{i}")
+
+                    arg_name_mapping = None
+                    if len(user_arg_names) == len(hls_arg_names):
+                        arg_name_mapping = dict(zip(user_arg_names, hls_arg_names))
+
+                    cfg_content = generate_hbm_config(
+                        self.top_func_name, hbm_mapping, arg_name_mapping
+                    )
+                    cfg_path = os.path.join(project, f"{self.top_func_name}.cfg")
+                    with open(cfg_path, "w", encoding="utf-8") as cfg_file:
+                        cfg_file.write(cfg_content)
                 # [NOTE] (Shihan): I guess tapa backend do not use this one. I modified codegen_host for vitis, similar logic should be updated for tapa if self.host_code is useful here
                 self.host_code = codegen_host(
                     self.top_func_name,
@@ -412,10 +556,10 @@ class HLSModule:
         elif self.platform == "vitis_hls":
             assert is_available("vitis_hls"), "vitis_hls is not available"
             if self.mode == "csim":
-                cwd = os.getcwd()
                 mod = IPModule(
                     top=self.top_func_name,
-                    impl=f"{cwd}/{self.project}/kernel.cpp",
+                    impl=f"{self.project}/kernel.cpp",
+                    include_paths=[self.project],
                     link_hls=True,
                 )
                 mod(*args)
@@ -488,11 +632,30 @@ class HLSModule:
                 process.wait()
                 if process.returncode != 0:
                     raise RuntimeError("Failed to run the executable")
-            # suppose the last argument is the output tensor
-            if np.isscalar(args[-1]):
-                raise RuntimeError("The output must be a tensor")
-            arr = np.fromfile(f"{self.project}/output.data", dtype=args[-1].dtype)
-            args[-1][:] = arr.reshape(args[-1].shape)
+            # Read output tensors from files
+            # Determine how many output files to read
+            func = find_func_in_module(self.module, self.top_func_name)
+            _, outputs = get_func_inputs_outputs(func)
+            if len(outputs) > 0:
+                # Original behavior: single output.data file
+                if np.isscalar(args[-1]):
+                    raise RuntimeError("The output must be a tensor")
+                arr = np.fromfile(f"{self.project}/output.data", dtype=args[-1].dtype)
+                args[-1][:] = arr.reshape(args[-1].shape)
+            else:
+                # Multiple output files: output0.data, output1.data, etc.
+                num_out = self.num_output_args if self.num_output_args > 0 else 1
+                for idx in range(num_out):
+                    out_arg_idx = len(inputs) - num_out + idx
+                    if out_arg_idx < 0 or out_arg_idx >= len(args):
+                        continue
+                    out_arg = args[out_arg_idx]
+                    if np.isscalar(out_arg):
+                        continue
+                    arr = np.fromfile(
+                        f"{self.project}/output{idx}.data", dtype=out_arg.dtype
+                    )
+                    out_arg[:] = arr.reshape(out_arg.shape)
             return
         elif self.platform == "pynq":
             # Do not assert PYNQ availability here; the presence of a physical
@@ -618,5 +781,111 @@ class HLSModule:
             )
             args[-1][:] = result
             return
-        else:
-            raise RuntimeError("Not implemented")
+        if self.platform == "catapult":
+            if self.mode == "csim":
+                # Check for input arguments
+                func = find_func_in_module(self.module, self.top_func_name)
+                inputs, outputs = get_func_inputs_outputs(func)
+                assert len(args) == len(inputs) + len(
+                    outputs
+                ), f"Number of arguments mismatch, got {len(args)}, expected {len(inputs) + len(outputs)}"
+
+                # Generate kernel.h
+                # self.args might be updated by separate_header if needed, but for csim we use passed args
+                header, _ = separate_header(
+                    self.hls_code, self.top_func_name, extern_c=False
+                )
+                with open(
+                    os.path.join(self.project, "kernel.h"), "w", encoding="utf-8"
+                ) as outfile:
+                    outfile.write(header)
+
+                # Write input data
+                for i, ((in_dtype, in_shape), arg) in enumerate(
+                    zip(inputs, args[: len(inputs)])
+                ):
+                    write_tensor_to_file(arg, in_shape, f"{self.project}/input{i}.data")
+
+                # Compilation with g++
+                # Assuming 'g++' is in PATH.
+                # Include path for ac_types
+                mgc_home = os.environ.get("MGC_HOME")
+                if not mgc_home:
+                    raise RuntimeError(
+                        "MGC_HOME environment variable is not set. Please set it to the Catapult installation directory."
+                    )
+
+                ac_include = os.path.join(mgc_home, "shared/include")
+                if not os.path.isdir(ac_include):
+                    raise RuntimeError(
+                        f"Catapult headers not found at {ac_include}. Check MGC_HOME."
+                    )
+
+                cmd = f"cd {self.project}; g++ -std=c++11 -I{ac_include} kernel.cpp host.cpp -o sim"
+                print(
+                    f"[{time.strftime('%H:%M:%S', time.gmtime())}] Compiling with g++ ..."
+                )
+                if shell:
+                    process = subprocess.Popen(cmd, shell=True)
+                else:
+                    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+                process.wait()
+                if process.returncode != 0:
+                    raise RuntimeError(
+                        "Failed to compile with g++. Check if g++ is installed and ac_types headers are correct."
+                    )
+
+                # Execution
+                cmd = f"cd {self.project}; ./sim"
+                print(
+                    f"[{time.strftime('%H:%M:%S', time.gmtime())}] Running simulation ..."
+                )
+                if shell:
+                    process = subprocess.Popen(cmd, shell=True)
+                else:
+                    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+                process.wait()
+                if process.returncode != 0:
+                    raise RuntimeError("Simulation failed.")
+
+                # Read outputs
+                for i, ((out_dtype, out_shape), out_arg) in enumerate(
+                    zip(outputs, args[len(inputs) :])
+                ):
+                    if not os.path.exists(f"{self.project}/output{i}.data"):
+                        raise RuntimeError(
+                            f"Output file output{i}.data not found. Simulation might have failed."
+                        )
+                    result = read_tensor_from_file(
+                        out_dtype, out_shape, f"{self.project}/output{i}.data"
+                    )
+                    out_arg[:] = result
+                return
+
+            if self.mode == "csyn":
+                catapult_cmd = "catapult"
+                if "MGC_HOME" in os.environ:
+                    catapult_cmd = os.path.join(os.environ["MGC_HOME"], "bin/catapult")
+
+                cmd = f"cd {self.project}; {catapult_cmd} -shell -f run.tcl"
+                assert len(args) == 0, "csyn mode does not need to pass in arguments"
+                print(
+                    f"[{time.strftime('%H:%M:%S', time.gmtime())}] Begin synthesizing project with Catapult HLS ..."
+                )
+                if shell:
+                    process = subprocess.Popen(cmd, shell=True)
+                else:
+                    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+                process.wait()
+                if process.returncode != 0:
+                    raise RuntimeError(
+                        "Failed to synthesize the design with Catapult HLS"
+                    )
+                print(
+                    f"[{time.strftime('%H:%M:%S', time.gmtime())}] Catapult HLS synthesis completed successfully"
+                )
+                return
+            raise RuntimeError(
+                f"Catapult backend currently only supports 'csyn' and 'csim' mode, got '{self.mode}'"
+            )
+        raise RuntimeError("Not implemented")

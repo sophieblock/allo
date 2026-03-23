@@ -987,7 +987,7 @@ class ComputationGraph:
                     def is_op_in_func(op_, target_func):
                         parent = op_
                         while parent is not None:
-                            if parent.operation.name == "func.func":
+                            if getattr(parent, "name", None) == "func.func":
                                 return parent == target_func
                             parent = parent.parent
                         return False
@@ -1014,7 +1014,7 @@ class ComputationGraph:
                         for i in range(len(stream_puts)):
                             stream_put: allo_d.StreamPutOp = stream_puts[i]
                             stream_get: allo_d.StreamGetOp = stream_gets[i]
-                            if stream_put.parent is stream_get.parent:
+                            if stream_put.parent == stream_get.parent:
                                 put_value = stream_put.operands[-1]
                                 get_result = stream_get.result
                                 get_result.replace_all_uses_with(put_value)

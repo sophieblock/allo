@@ -5,6 +5,7 @@
 import ast
 from .._mlir import InsertionPoint
 from .._mlir.dialects import allo as allo_d
+from ..utils import register_dialect
 
 
 class BlockScopeGuard:
@@ -56,6 +57,7 @@ class ASTContext:
         unroll=True,
         meta_fors_to_unroll=None,
         enable_tensor=False,
+        typing_rule_set="default",
         verbose=False,
     ):
         self.ip_stack = []
@@ -68,7 +70,7 @@ class ASTContext:
         self.global_vars = global_vars
         self.mlir_ctx = mlir_ctx
         self.file_name = None
-        allo_d.register_dialect(mlir_ctx)
+        register_dialect(mlir_ctx)
         # map from function name to function arguments
         self.func_args = {} if func_args is None else func_args
         self.func_id = None
@@ -88,6 +90,7 @@ class ASTContext:
         # whether the instances are unrolled at ir build time
         self.unroll = unroll
         self.enable_tensor = enable_tensor
+        self.typing_rule_set = typing_rule_set
         self.verbose = verbose
         # libraries for external IPs
         self.ext_libs = []
@@ -116,6 +119,8 @@ class ASTContext:
         # used for tensor mapping
         self.rank = 0
         self.mapping = None
+        # track the current AST node being visited for error reporting
+        self.current_node = None
 
     def copy(self):
         ctx = ASTContext(
@@ -128,6 +133,7 @@ class ASTContext:
             self.func_tag2instance,
             unroll=self.unroll,
             enable_tensor=self.enable_tensor,
+            typing_rule_set=self.typing_rule_set,
             verbose=self.verbose,
         )
         ctx.func_id = self.func_id
@@ -138,6 +144,9 @@ class ASTContext:
         ctx.rank = self.rank
         ctx.mapping = self.mapping
         ctx.meta_fors_to_unroll = self.meta_fors_to_unroll
+        ctx.current_node = self.current_node
+        if hasattr(self, "func_suffix"):
+            ctx.func_suffix = self.func_suffix
         return ctx
 
     def set_ip(self, ip):
@@ -240,6 +249,8 @@ class ASTVisitor:
     def __call__(self, ctx, node):
         if node is None:
             return None
+        # Track the current node being visited for error reporting
+        ctx.current_node = node
         method = getattr(type(self), "visit_" + node.__class__.__name__, None)
         if method is None:
             error_msg = f'Unsupported node "{node.__class__.__name__}"'
@@ -323,9 +334,7 @@ class ASTVisitor:
 
     @staticmethod
     def visit_FunctionDef(ctx, node):
-        print("inside fundef")
         visit_stmts(ctx, node.body)
-        print("end inside fundef")
 
     @staticmethod
     def visit_Compare(ctx, node):
@@ -355,9 +364,7 @@ class ASTVisitor:
     @staticmethod
     def visit_Module(ctx, node):
         for stmt in node.body:
-            print("stmt", stmt)
             visit_stmt(ctx, stmt)
-            print("end", stmt)
 
     @staticmethod
     def visit_Call(ctx, node):
@@ -407,8 +414,6 @@ class ReplaceNames(ast.NodeTransformer):
         self.special_symbol = set()
 
     def visit_Name(self, node):
-        if node.id in self.variables:
-            raise ValueError("Fail to resolve the expression as symbolic expression.")
         if node.id in self.symbolic_mapping:
             symbol_var = self.symbolic_mapping[node.id]
             if isinstance(symbol_var, str):
@@ -422,6 +427,8 @@ class ReplaceNames(ast.NodeTransformer):
             return new_node
         if node.id in self.var_map:
             return ast.Constant(self.var_map[node.id])
+        if node.id in self.variables:
+            raise ValueError("Fail to resolve the expression as symbolic expression.")
         return node
 
 

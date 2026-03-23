@@ -4,6 +4,7 @@
 
 import ast
 import inspect
+import textwrap
 from collections.abc import Callable
 from types import FunctionType as PyFunctionType
 from .._mlir.ir import (
@@ -23,23 +24,47 @@ from .._mlir.dialects import (
     tensor as tensor_d,
     func as func_d,
 )
-from .types import AlloType, Int, UInt, Fixed, UFixed, Index
+from .types import AlloType, Int, UInt, Fixed, UFixed, Index, Float
 from .symbol_resolver import ASTResolver
 
 
-def _get_global_vars(_func):
+def _get_global_vars(_func, skip: set[str] = None, stop: set[str] = None):
+    """
+    Collect global variables from the call stack of a Python function.
+
+    Args:
+        skip: Set of frame names to skip over when walking the call stack.
+              Frames whose co_name is in `skip` are ignored (no variables collected), and the walk continues to the next outer frame.
+              This is mainly used to skip compiler internal functions when collecting global variables used in source code.
+        stop: Set of frame names that act as boundaries for the stack walk.
+              When a frame whose co_name is in `stop` is reached, its variables are collected and then the walk terminates.
+    """
+    if skip is None:
+        skip = {"get_global_vars", "customize", "build"}
+    if stop is None:
+        stop = {"<module>"}
     if isinstance(_func, Callable):
         # Discussions: https://github.com/taichi-dev/taichi/issues/282
         global_vars = _func.__globals__.copy()
     else:
         global_vars = {}
 
-    # Get back to the outer-most scope (user-defined function)
+    # Get back to outer scopes
     # Mainly used to get the annotation definitions (shape and type),
     # which are probably not defined in __globals__
-    for name, var in inspect.stack()[3][0].f_locals.items():
-        if isinstance(var, (int, float, AlloType)) or inspect.isfunction(var):
-            global_vars[name] = var
+    frame = inspect.currentframe().f_back
+    while frame:
+        if frame.f_code.co_name in skip:
+            frame = frame.f_back
+            continue
+        # collect allowed types
+        for name, var in frame.f_locals.items():
+            if isinstance(var, (int, float, AlloType)) or inspect.isfunction(var):
+                global_vars[name] = var
+        # boundary
+        if frame.f_code.co_name in stop:
+            break
+        frame = frame.f_back
 
     if isinstance(_func, Callable):
         freevar_names = _func.__code__.co_freevars
@@ -52,13 +77,25 @@ def _get_global_vars(_func):
 
 
 def get_global_vars(func):
-    global_vars = _get_global_vars(func)
-    new_global_vars = global_vars.copy()
-    for var in global_vars.values():
-        # import functions from other files
-        if isinstance(var, PyFunctionType):
-            new_global_vars.update(_get_global_vars(var))
-    return new_global_vars
+    all_globals = {}
+    worklist = [func]
+    visited_funcs = set()
+
+    while worklist:
+        f = worklist.pop()
+        if f in visited_funcs:
+            continue
+        visited_funcs.add(f)
+
+        gv = _get_global_vars(f)
+        for name, val in gv.items():
+            if name not in all_globals:
+                all_globals[name] = val
+                # import functions from other files
+                if isinstance(val, PyFunctionType):
+                    worklist.append(val)
+
+    return all_globals
 
 
 def get_extra_type_hints(dtype: AlloType):
@@ -77,6 +114,25 @@ def get_kwarg(kwargs, name):
     raise RuntimeError(f"Keyword argument {name} not found")
 
 
+def _ast_to_value(node):
+    """Convert an AST node to its Python value (Python 3.12+)."""
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.List):
+        return [_ast_to_value(elt) for elt in node.elts]
+    if isinstance(node, ast.Tuple):
+        return tuple(_ast_to_value(elt) for elt in node.elts)
+    return node
+
+
+def get_kwarg_value(kwargs, name, default=None):
+    """Get a keyword argument value, returning default if not found."""
+    for keyword in kwargs:
+        if keyword.arg == name:
+            return _ast_to_value(keyword.value)
+    return default
+
+
 def _adjust_line_numbers(node, offset):
     for child in ast.walk(node):
         if hasattr(child, "lineno"):
@@ -85,7 +141,13 @@ def _adjust_line_numbers(node, offset):
             child.end_lineno += offset
 
 
-def parse_ast(src, starting_line_no=1, verbose=False):
+def parse_ast(src, verbose=False):
+    if isinstance(src, str):
+        starting_line_no = 1
+    else:
+        src, starting_line_no = inspect.getsourcelines(src)
+        src = [textwrap.fill(line, tabsize=4, width=9999) for line in src]
+        src = textwrap.dedent("\n".join(src))
     tree = ast.parse(src)
     _adjust_line_numbers(tree, starting_line_no - 1)
     if verbose:
@@ -109,7 +171,12 @@ def get_func_id_from_param_types(param_types):
 def get_all_df_kernels(s):
     funcs = []
     for func in s.module.body.operations:
-        if isinstance(func, func_d.FuncOp) and "df.kernel" in func.attributes:
+        # Exclude nested kernels (those inside sub-regions) from top-level calls
+        if (
+            isinstance(func, func_d.FuncOp)
+            and "df.kernel" in func.attributes
+            and "df.nested_kernel" not in func.attributes
+        ):
             funcs.append(func)
     return funcs
 
@@ -182,9 +249,15 @@ class MockConstant(MockOp):
     @property
     def result(self):
         if self.dtype is not None:
-            assert isinstance(self.dtype, Index)
             dtype = self.dtype.build()
-            value_attr = IntegerAttr.get(dtype, self.val)
+            if isinstance(self.dtype, (Int, UInt, Index)):
+                value_attr = IntegerAttr.get(dtype, self.val)
+            elif isinstance(self.dtype, Float):
+                value_attr = FloatAttr.get(dtype, self.val)
+            else:
+                raise ValueError(
+                    f"Fail to resolve MockConstant with dtype {self.dtype}"
+                )
         elif isinstance(self.val, int):
             dtype = IntegerType.get_signless(32)
             value_attr = IntegerAttr.get(dtype, self.val)

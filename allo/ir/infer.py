@@ -4,11 +4,7 @@
 
 import ast
 import copy
-import sys
 import os
-import traceback
-import inspect
-import textwrap
 import warnings
 import sympy
 import numpy as np
@@ -23,12 +19,16 @@ from .types import (
     UFixed,
     Index,
     uint1,
+    int4,
+    int8,
     int32,
     float16,
     float32,
     float64,
     Struct,
     Stream,
+    Stateful,
+    ConstExpr,
 )
 from .typing_rule import get_typing_rule
 from ..utils import (
@@ -40,7 +40,6 @@ from ..utils import (
     construct_kernel_name,
 )
 from ..memory import DTensor, Layout
-from ..logging import print_error_message
 from .utils import parse_ast, get_func_id_from_param_types, resolve_generic_types
 
 
@@ -104,11 +103,22 @@ class TypeInferer(ASTVisitor):
                 stream_dtype = Stream(dtype=base_type, shape=base_shape, depth=depth)
                 shape = tuple()
                 return stream_dtype, shape, None
+            if dtype is ConstExpr:
+                # e.g., a: ConstExpr[int32]
+                base_type, base_shape, _ = TypeInferer.visit_type_hint(ctx, node.slice)
+                assert len(base_shape) == 0, "ConstExpr only supports scalar types"
+                const_dtype = copy.deepcopy(base_type)
+                const_dtype.constexpr = True
+                return const_dtype, tuple(), None
             assert dtype is not None, f"Unsupported type `{node.value.id}`"
             size = node.slice.value if isinstance(node.slice, ast.Index) else node.slice
             elts = size.elts if isinstance(size, ast.Tuple) else [size]
             shape = tuple(ASTResolver.resolve_constant(x, ctx) for x in elts)
-            return dtype, shape, Layout("R" * len(shape))  # default layout
+            return (
+                dtype,
+                shape,
+                Layout([Layout.Replicate] * len(shape)),
+            )  # default layout
         if isinstance(node, ast.Name):
             dtype = ASTResolver.resolve(node, ctx.global_vars)
             assert dtype is not None, f"Unsupported type `{node.id}`"
@@ -126,9 +136,17 @@ class TypeInferer(ASTVisitor):
             return dtype, tuple(), None
         if isinstance(node, ast.BinOp):
             # memory refinement
-            # e.g., A: Ty[M] @ Layout("S0")
-            dtype, shape, _ = TypeInferer.visit_type_hint(ctx, node.left)
+            # or, stateful variable
+            # e.g., A: Ty[M] @ stateful
+            dtype, shape, node_left_layout = TypeInferer.visit_type_hint(ctx, node.left)
             spec = ASTResolver.resolve(node.right, ctx.global_vars)
+            if isinstance(spec, list):
+                spec = Layout(spec)
+            if spec is Stateful:
+                # Create a copy with stateful=True
+                stateful_dtype = copy.deepcopy(dtype)
+                stateful_dtype.stateful = True
+                return stateful_dtype, shape, node_left_layout
             return dtype, shape, spec
         raise RuntimeError("Unsupported function argument type")
 
@@ -311,7 +329,7 @@ class TypeInferer(ASTVisitor):
     def visit_general_binop(
         ctx: ASTContext, node: ast.AugAssign | ast.BinOp, lhs: ast.expr, rhs: ast.expr
     ):
-        typing_rule = get_typing_rule(type(node.op))
+        typing_rule = get_typing_rule(type(node.op), ctx.typing_rule_set)
         res_type = typing_rule(lhs.dtype, rhs.dtype)
         node.dtype = res_type
         final_shape, lhs_dims, rhs_dims = TypeInferer.visit_broadcast(
@@ -454,11 +472,7 @@ class TypeInferer(ASTVisitor):
         else:
             raise RuntimeError("Unsupported AugAssign")
         # augment LHS
-        TypeInferer.visit_general_binop(ctx, node, lhs, rhs)
-        # store LHS
-        node.dtype = lhs.dtype
-        node.shape = lhs.shape
-        return node
+        return TypeInferer.visit_general_binop(ctx, node, lhs, rhs)
 
     @staticmethod
     def visit_symbol(ctx: ASTContext, node: ast.expr):
@@ -628,13 +642,38 @@ class TypeInferer(ASTVisitor):
                 ctx, value, ctx.global_vars[value.id], dtype=target_dtype
             )
             value.dtype = target_dtype
+        elif isinstance(value, ast.Subscript) and isinstance(value.value, ast.Name):
+            # Handle slicing of a constant numpy array, e.g., np_array[pid]
+            array_name = value.value.id
+            if array_name in ctx.global_vars and isinstance(
+                ctx.global_vars[array_name], np.ndarray
+            ):
+                assert target_shape is not None and target_dtype is not None
+                np_array = ctx.global_vars[array_name]
+                # Evaluate slice with current context to validate shape
+                slice_expr = compile(ast.Expression(value.slice), "", "eval")
+                # pylint: disable=eval-used
+                slice_val = eval(slice_expr, ctx.global_vars)
+                sliced_array = np_array[slice_val]
+                if not isinstance(sliced_array, np.ndarray):
+                    sliced_array = np.array([sliced_array], dtype=np_array.dtype)
+                assert (
+                    sliced_array.shape == target_shape
+                ), f"Slice shape mismatch, got {sliced_array.shape} and {target_shape}"
+                # Store source array for deferred evaluation in builder
+                # The slice AST is already available as value.slice
+                value.const_array_source = np_array
+                value.dtype = target_dtype
+                value.shape = target_shape
+            else:
+                visit_stmt(ctx, value)
         else:
             visit_stmt(ctx, value)
         return value
 
     @staticmethod
     def visit_AnnAssign(ctx: ASTContext, node: ast.AnnAssign):
-        target_dtype, target_shape, _ = TypeInferer.visit_type_hint(
+        target_dtype, target_shape, spec = TypeInferer.visit_type_hint(
             ctx, node.annotation
         )
         assert isinstance(
@@ -649,15 +688,30 @@ class TypeInferer(ASTVisitor):
             assert (
                 target_.dtype == target_dtype and target_.shape == target_shape
             ), f"Invalid assignment to {node.target.id}, type mismatch."
-        # rhs
-        rhs = TypeInferer.visit_assignment_val(
-            ctx, node.value, target_shape, target_dtype
-        )
-        if target_ is None:
-            # new def
+
+        # If the variable is a compile-time constant (ConstExpr), we should evaluate
+        # the RHS at Python level using ASTResolver.resolve() BEFORE calling
+        # visit_assignment_val, which would otherwise try to compile function calls.
+        if getattr(target_dtype, "constexpr", False):
+            val = ASTResolver.resolve(node.value, ctx.global_vars)
+            ctx.global_vars[node.target.id] = val
+            # Set value attributes for downstream processing
+            node.value.dtype = target_dtype
+            node.value.shape = target_shape
+            rhs = node.value
+        else:
+            # rhs - normal processing
+            rhs = TypeInferer.visit_assignment_val(
+                ctx, node.value, target_shape, target_dtype
+            )
+
+        if target_ is None and not getattr(target_dtype, "constexpr", False):
+            # new def - but NOT for ConstExpr, which should only be in global_vars
             ctx.put_symbol(name=node.target.id, val=node.target)
         node.target.dtype = node.dtype = target_dtype
         node.target.shape = node.shape = target_shape
+        # Store the memory/layout spec for local variables
+        node.target.spec = node.spec = spec
         final_shape, lhs_dims, rhs_dims = TypeInferer.visit_broadcast(
             ctx,
             node.target.shape,
@@ -683,12 +737,32 @@ class TypeInferer(ASTVisitor):
                 if isinstance(decorator, ast.Call):
                     if isinstance(decorator.func, ast.Attribute):
                         if decorator.func.attr == "kernel":
-                            assert len(decorator.keywords) > 0, "Missing kernel mapping"
-                            mapping = eval(
-                                ast.unparse(decorator.keywords[0].value),
-                                ctx.global_vars,
-                            )
+                            mapping, kernel_args = None, []
+                            for kw in decorator.keywords:
+                                if kw.arg == "mapping":
+                                    mapping = eval(
+                                        ast.unparse(kw.value),
+                                        ctx.global_vars,
+                                    )
+                                elif kw.arg == "args":
+                                    assert isinstance(kw.value, ast.List)
+                                    kernel_args = kw.value.elts
+                            assert (
+                                mapping is not None
+                            ), f"Invalid @df.kernel decorator on function '{node.name}': missing required 'mapping' parameter."
                             old_ctx.mapping = mapping
+                            assert len(kernel_args) == len(
+                                node.args.args
+                            ), f"Invalid @df.kernel decorator on function '{node.name}': 'args' length mismatch (expected {len(node.args.args)}, got {len(kernel_args)})."
+                            for top_arg_name, arg in zip(kernel_args, node.args.args):
+                                top_arg = ctx.get_symbol(name=top_arg_name.id)
+                                dtype, shape, _ = TypeInferer.visit_type_hint(
+                                    ctx, arg.annotation
+                                )
+                                assert (
+                                    top_arg.dtype == dtype and top_arg.shape == shape
+                                ), f"df.kernel argument {arg.arg} do not match {top_arg_name.id}."
+                                arg.top_arg = top_arg_name.id
                             orig_name = node.name
                             old_ctx.func_predicate_tags[orig_name] = {}
                             if ctx.unroll:
@@ -776,8 +850,19 @@ class TypeInferer(ASTVisitor):
                 arg.dtype, arg.shape, arg.spec = TypeInferer.visit_type_hint(
                     ctx, arg.annotation
                 )
+                if hasattr(arg.dtype, "stateful") and arg.dtype.stateful:
+                    raise RuntimeError(
+                        f"Function parameter '{arg.arg}' cannot be Stateful. "
+                        "Stateful variables can only be declared locally within a kernel."
+                    )
                 arg.dtensor = DTensor(
-                    ctx.rank, ctx.mapping, arg.shape, arg.dtype, arg.spec, name=arg.arg
+                    ctx.rank,
+                    ctx.mapping,
+                    arg.shape,
+                    arg.dtype,
+                    arg.spec,
+                    name=arg.arg,
+                    top_name=arg.arg if not hasattr(arg, "top_arg") else arg.top_arg,
                 )
                 # update shape
                 arg.shape = arg.dtensor.get_local_shape()
@@ -843,9 +928,9 @@ class TypeInferer(ASTVisitor):
         lhs = visit_stmt(ctx, node.left)
         assert len(node.comparators) == 1, "Only support one comparator for now"
         rhs = visit_stmt(ctx, node.comparators[0])
-        typing_rule = get_typing_rule(type(node.ops[0]))
-        res_type = typing_rule(lhs.dtype, rhs.dtype)[0]
-        node.dtype = res_type
+        typing_rule = get_typing_rule(type(node.ops[0]), ctx.typing_rule_set)
+        operand_type = typing_rule(lhs.dtype, rhs.dtype)
+        node.dtype = operand_type
         node.shape = tuple()
         return node
 
@@ -861,7 +946,7 @@ class TypeInferer(ASTVisitor):
         visit_stmt(ctx, node.test)
         visit_stmt(ctx, node.body)
         visit_stmt(ctx, node.orelse)
-        typing_rule = get_typing_rule(ast.IfExp)
+        typing_rule = get_typing_rule(ast.IfExp, ctx.typing_rule_set)
         res_type = typing_rule(node.body.dtype, node.orelse.dtype)
         node.dtype = res_type
         node.shape = node.body.shape
@@ -1026,7 +1111,7 @@ class TypeInferer(ASTVisitor):
                     len(node.args) == 2
                 ), "Only support two arguments for `min` and `max`"
                 new_args = visit_stmts(ctx, node.args)
-                typing_rule = get_typing_rule("minmax")
+                typing_rule = get_typing_rule("minmax", ctx.typing_rule_set)
                 res_type = typing_rule(new_args[0].dtype, new_args[1].dtype)
                 node.dtype = res_type
                 node.shape = new_args[0].shape
@@ -1162,12 +1247,7 @@ class TypeInferer(ASTVisitor):
         else:
             # Visit arguments in the top-level
             visit_stmts(ctx, node.args)
-            src, starting_line_no = inspect.getsourcelines(func)
-            src = [textwrap.fill(line, tabsize=4, width=9999) for line in src]
-            src = textwrap.dedent("\n".join(src))
-            tree = parse_ast(
-                src, starting_line_no=starting_line_no, verbose=ctx.verbose
-            )
+            tree = parse_ast(func, verbose=ctx.verbose)
             # Create a new context to avoid name collision
             func_ctx = ctx.copy()
             stmts = visit_stmts(func_ctx, tree.body)
@@ -1229,6 +1309,9 @@ class TypeInferer(ASTVisitor):
                     argAshape[3] - argBshape[1] + 1,
                 )
             elif op_name == "matmul":
+                # FIXME (Shihan): for aie backend
+                if not ctx.unroll and node.dtype == int4:
+                    node.dtype = int8
                 assert (
                     argAshape[-1] == argBshape[-2]
                 ), f"The last dimension of the first input and the second last dimension of the second input must be the same, got {argAshape} and {argBshape}"
@@ -1343,11 +1426,24 @@ class TypeInferer(ASTVisitor):
         # Compile-time comparison
         if node.items[0].context_expr.func.attr in {"meta_if", "meta_elif"}:
             cond = ASTResolver.resolve_constant(node.items[0].context_expr.args[0], ctx)
+            alive_var_names = ctx.get_alive_var_names()
+            # Filter out ConstExpr variables from alive_var_names
+            filtered_var_names = set()
+            for name in alive_var_names:
+                sym = ctx.get_symbol(name)
+                # If the symbol is a ConstExpr, we should treat it as a constant
+                # and allow it to be resolved by the ASTResolver / ReplaceNames.
+                # Therefore, we remove it from the "variables" list which represents
+                # dynamic variables that cannot be resolved at compile time.
+                if not (
+                    hasattr(sym, "dtype") and getattr(sym.dtype, "constexpr", False)
+                ):
+                    filtered_var_names.add(name)
             symbolic_cond, loops_to_unroll = get_symbolic_expr(
                 copy.deepcopy(node.items[0].context_expr.args[0]),
                 ctx.symbolic,
                 ctx.global_vars,
-                ctx.get_alive_var_names(),
+                filtered_var_names,
             )
             ctx.meta_fors_to_unroll.update(loops_to_unroll)
             if node.items[0].context_expr.func.attr == "meta_if":
@@ -1474,11 +1570,5 @@ visit_stmt = TypeInferer()
 def visit_stmts(ctx: ASTContext, stmts: list[ast.expr]):
     results = []
     for stmt in stmts:
-        try:
-            results.append(visit_stmt(ctx, stmt))
-        # pylint: disable=broad-exception-caught
-        except Exception as e:
-            print(f"{traceback.format_exc()}")
-            print_error_message(str(e), stmt, ctx.top_func_tree)
-            sys.exit(1)
+        results.append(visit_stmt(ctx, stmt))
     return results
